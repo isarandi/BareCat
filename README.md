@@ -53,12 +53,19 @@ barecat-extract --file mydata.barecat --target-directory targetdir/
 
 import barecat
 
+writer = barecat.Writer('mydata.barecat')
+writer.add_by_content('path/to/file/as/stored.jpg', binary_file_data)
+writer.add_by_path('path/to/file/on/disk.jpg')
+with open('path', 'rb') as f:
+    writer.add_by_fileobj('path/to/file/on/disk.jpg', f)
+    
+writer.close()  # or use a context manager in a `with` block
+
 reader = barecat.Reader('mydata.barecat')
 binary_file_data = reader['path/to/file.jpg']
 subdirnames, filenames = reader.listdir('path/to/directory')
 
 reader.close()  # or use a context manager in a `with` block
-
 
 ```
 
@@ -86,3 +93,9 @@ See for example:
 
 Other alternatives include TensorFlow's TFRecord format or HDF5. However, these are more complex to use
 and have many features that are not needed for this use case.
+
+
+![BareCat](barecat.jpg)
+
+
+ 
