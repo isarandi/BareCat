@@ -13,7 +13,7 @@ However, typical archive formats such as tar are not suitable, since they don't 
 lookups. We need an index into the archive, and the index itself cannot be required to be loaded
 into memory, to support very large datasets.
 
-The metadata is indexed separately in an SQLite database for fast lookup based on paths. The index
+Therefore, in this format the metadata is indexed separately in an SQLite database for fast lookup based on paths. The index
 also allows fast listing of directory contents and contains aggregate statistics (total file size,
 number of files) for each directory.
 
@@ -39,6 +39,14 @@ To create a BareCat archive, use the `barecat-create` command:
 ```bash
 barecat-create --file mydata.barecat --shard-size 10G < path_of_paths.txt 
 find . -name '*.jpg' -print0 | barecat-create --null --file mydata.barecat --shard-size 10G
+```
+
+This may yield the following files:
+
+```
+mydata.barecat-00000-of-00002
+mydata.barecat-00001-of-00002
+mydata.barecat-sqlite-index
 ```
 
 The files can be extracted out again but metadata is lost:
