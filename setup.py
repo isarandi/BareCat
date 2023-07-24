@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='barecat',
-    version='0.1.0',
+    version='0.1.1',
     author='István Sárándi',
     author_email='istvan.sarandi@gmail.com',
     packages=['barecat'],
@@ -15,8 +15,9 @@ setup(
         'console_scripts': [
             'barecat-create=barecat.command_line_interface:create',
             'barecat-extract=barecat.command_line_interface:extract',
-            'barecat-index-to-json=barecat.command_line_interface:index_to_json',
-            'barecat-image-viewer=barecat.image_viewer:main',
+            'barecat-extract-single=barecat.command_line_interface:extract_single',
+            'barecat-index-to-csv=barecat.command_line_interface:index_to_csv',
+            'barecat-viewer=barecat.viewer:main',
         ],
     }
 )

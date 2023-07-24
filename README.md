@@ -54,7 +54,7 @@ barecat-extract --file mydata.barecat --target-directory targetdir/
 import barecat
 
 writer = barecat.Writer('mydata.barecat')
-writer.add_by_content('path/to/file/as/stored.jpg', binary_file_data)
+writer['path/to/file/as/stored.jpg'] = binary_file_data
 writer.add_by_path('path/to/file/on/disk.jpg')
 with open('path', 'rb') as f:
     writer.add_by_fileobj('path/to/file/on/disk.jpg', f)

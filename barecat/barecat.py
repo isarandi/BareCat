@@ -1,56 +1,53 @@
+import binascii
 import glob
-import hashlib
 import io
-import json
 import os
 import os.path as osp
 import shutil
-import sqlite3
+
+from barecat.indexing import IndexReader, IndexWriter
 
 
 class Reader:
-    def __init__(self, path):
+    def __init__(self, path, decoder=None):
         self.index = IndexReader(f'{path}-sqlite-index')
         shard_names = sorted(glob.glob(f'{path}-*-of-*'))
         self.shard_files = [open(p, mode='rb') for p in shard_names]
+        self.decoder = decoder if decoder is not None else lambda x: x
 
     def __getitem__(self, path):
-        address = self.index[path]
-        return self.read_from_address(address)
+        shard, offset, size, crc32 = self.index[path]
+        return self.read_from_address(shard, offset, size, crc32)
 
     def open(self, path):
-        shard, offset, size = self.index[path]
-        shard_file = self.shard_files[shard]
-        return FileSection(shard_file, offset, size)
+        shard, offset, size, crc32 = self.index[path]
+        return FileSection(self.shard_files[shard], offset, size)
 
-    def read_from_address(self, address):
-        shard, offset, size = address
+    def read_nth(self, n):
+        path, (shard, offset, size, crc32) = self.index.get_nth(n)
+        return path, self.read_from_address(shard, offset, size, crc32)
+
+    def read_from_address(self, shard, offset, size, expected_crc32=None):
         shard_file = self.shard_files[shard]
         shard_file.seek(offset)
-        return shard_file.read(size)
+        data = shard_file.read(size)
+
+        if expected_crc32 is not None:
+            crc32 = binascii.crc32(data)
+            if crc32 != expected_crc32:
+                path = self.index.reverse_lookup(shard, offset)
+                raise ValueError(
+                    f"CRC32 mismatch for {path}. Expected {expected_crc32}, got {crc32}")
+
+        return self.decoder(data)
 
     def items(self):
-        for path, address in self.index.items():
-            yield path, self.read_from_address(address)
+        for path, (shard, offset, size, crc32) in self.index.items():
+            yield path, self.read_from_address(shard, offset, size, crc32)
 
     def items_random(self):
-        for path, address in self.index.items_random():
-            yield path, self.read_from_address(address)
-
-    def listdir(self, path):
-        return self.index.listdir(path)
-
-    def walk(self, dirpath=''):
-        return self.index.walk(dirpath)
-
-    def get_subtree_size(self, dirpath):
-        return self.index.get_subtree_size(dirpath)
-
-    def get_subtree_file_count(self, dirpath):
-        return self.index.get_subtree_file_count(dirpath)
-
-    def get_file_size(self, path):
-        return self.index.get_file_size(path)
+        for path, (shard, offset, size, crc32) in self.index.items_random():
+            yield path, self.read_from_address(shard, offset, size, crc32)
 
     def close(self):
         self.index.close()
@@ -74,17 +71,19 @@ class Reader:
 
 
 class Writer:
-    def __init__(self, path, shard_size=None, write_checksums=True, overwrite=False):
+    def __init__(self, path, shard_size=None, overwrite=False, encoder=None):
         self.path = path
         self.shard_size = shard_size
         self.index = IndexWriter(f'{self.path}-sqlite-index', overwrite=overwrite)
         self.i_shard = 0
         self.shard_file = open(
             f'{self.path}-{self.i_shard:05d}', mode='wb' if overwrite else 'xb')
-        self.write_checksums = write_checksums
+        self.encoder = encoder if encoder is not None else lambda x: x
 
-    def add_by_content(self, path, file_content):
-        self.add_by_fileobj(path, io.BytesIO(file_content), len(file_content))
+    def __setitem__(self, path, content):
+        packed_content = self.encoder(content)
+        size = len(packed_content)
+        self.add_by_fileobj(path, io.BytesIO(packed_content), size, bufsize=size)
 
     def add_by_path(self, path, path_transform=None):
         store_path = path_transform(path) if path_transform else path
@@ -92,7 +91,7 @@ class Writer:
         with open(path, 'rb') as in_file:
             self.add_by_fileobj(store_path, in_file, size)
 
-    def add_by_fileobj(self, path, fileobj, size):
+    def add_by_fileobj(self, path, fileobj, size, bufsize=shutil.COPY_BUFSIZE):
         if self.shard_size is not None:
             if size > self.shard_size:
                 raise ValueError(f'File "{path}" is too large to fit into a shard')
@@ -102,15 +101,16 @@ class Writer:
                 self.shard_file = open(f'{self.path}-{self.i_shard:05d}', 'wb')
 
         offset = self.shard_file.tell()
-        shutil.copyfileobj(fileobj, self.shard_file)
-        self.index[path] = (self.i_shard, offset, size)
+        crc32 = 0
+        while chunk := fileobj.read(bufsize):
+            self.shard_file.write(chunk)
+            crc32 = binascii.crc32(chunk, crc32)
+        self.index.add_item(path, self.i_shard, offset, size, crc32)
 
     def close(self):
         self.index.close()
         self.shard_file.close()
         self.rename_shards()
-        if self.write_checksums:
-            self.write_checksum_file()
 
     def rename_shards(self):
         n_shards = self.i_shard + 1
@@ -120,247 +120,58 @@ class Writer:
             os.rename(shard_file, renamed_file)
         return n_shards
 
-    def write_checksum_file(self):
-        n_shards = self.i_shard + 1
-        checksums = {
-            f'{i:05d}-of-{n_shards:05d}':
-                get_sha1(f'{self.path}-{i:05d}-of-{n_shards:05d}')
-            for i in range(n_shards)}
-        checksums['sqlite-index'] = get_sha1(f'{self.path}-sqlite-index')
-        with open(f'{self.path}-sha1-checksums', 'w') as f:
-            json.dump(checksums, f, indent=2)
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
-
-
-class IndexReader:
-    def __init__(self, path):
-        self.conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
-        self.cursor = self.conn.cursor()
-
-    def __getitem__(self, path):
-        path = normalize_path(path)
-        return self.fetch_one('SELECT shard, offset, size FROM files WHERE path=?', (path,))
-
-    def items(self):
-        for path, shard, offset, size in self.fetch_iter(
-                'SELECT path, shard, offset, size FROM files ORDER BY shard, offset'):
-            yield path, (shard, offset, size)
-
-    def items_random(self):
-        for path, shard, offset, size in self.fetch_iter(
-                'SELECT path, shard, offset, size FROM files ORDER BY RANDOM()'):
-            yield path, (shard, offset, size)
-
-    def __len__(self):
-        return self.fetch_one('SELECT COUNT(*) FROM files')[0]
-
-    def __iter__(self):
-        for path, in self.fetch_iter('SELECT path FROM files ORDER BY shard, offset'):
-            yield path
-
-    def iter_random(self):
-        for path, in self.fetch_iter('SELECT path FROM files ORDER BY RANDOM()'):
-            yield path
-
-    def listdir(self, dirpath):
-        subdirs = [
-            osp.basename(path)
-            for path, in self.fetch_all('SELECT path FROM directories WHERE parent=?', (dirpath,))]
-        files = [
-            osp.basename(path)
-            for path, in self.fetch_all('SELECT path FROM files WHERE parent=?', (dirpath,))]
-        return subdirs, files
-
-    def walk(self, root):
-        root = normalize_path(root)
-        dirs_to_walk = [root]
-
-        while dirs_to_walk:
-            dirpath = dirs_to_walk.pop()
-            subdirs, files = self.listdir(dirpath)
-
-            yield dirpath, subdirs, files
-
-            for subdir in subdirs:
-                subdir_path = osp.join(dirpath, subdir)
-                dirs_to_walk.append(subdir_path)
-
-    def get_subtree_size(self, dirpath):
-        dirpath = normalize_path(dirpath)
-        return self.fetch_one('SELECT total_size FROM directories WHERE path = ?', (dirpath,))[0]
-
-    def get_subtree_file_count(self, dirpath):
-        dirpath = normalize_path(dirpath)
-        return self.fetch_one(
-            'SELECT total_file_count FROM directories WHERE path = ?', (dirpath,))[0]
-
-    def get_last_inserted_item(self):
-        return self.fetch_one('SELECT path FROM files ORDER BY shard DESC, offset DESC LIMIT 1')[0]
-
-    def get_file_size(self, path):
-        path = normalize_path(path)
-        return self.fetch_one('SELECT size FROM files WHERE path=?', (path,))[0]
-
-    def __contains__(self, path):
-        return self.fetch_one('SELECT 1 FROM files WHERE path=?', (path,)) is not None
-
-    def fetch_iter(self, query, params=(), buffer_size=32):
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        while rows := cursor.fetchmany(buffer_size):
-            yield from rows
-        cursor.close()
-
-    def fetch_one(self, query, params=()):
-        self.cursor.execute(query, params)
-        return self.cursor.fetchone()
-
-    def fetch_all(self, query, params=()):
-        self.cursor.execute(query, params)
-        return self.cursor.fetchall()
-
-    def close(self):
-        self.cursor.close()
-        self.conn.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-
-class IndexWriter:
-    def __init__(self, path, overwrite=False):
-        if osp.exists(path):
-            if overwrite:
-                os.remove(path)
-            else:
-                raise FileExistsError(path)
-
-        self.conn = sqlite3.connect(path)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute(f"""
-            CREATE TABLE files (
-                path TEXT PRIMARY KEY, 
-                parent TEXT, 
-                shard INTEGER, 
-                offset INTEGER, 
-                size INTEGER
-            )
-        """)
-        self.cursor.execute(f"""
-            CREATE TABLE directories (
-                path TEXT PRIMARY KEY, 
-                parent TEXT,
-                total_size INTEGER DEFAULT 0, 
-                total_file_count INTEGER DEFAULT 0
-            )
-        """)
-        self.cursor.execute(
-            f'CREATE INDEX idx_directories_parent ON directories (parent)')
-        self.cursor.execute(f'CREATE INDEX idx_files_parent ON files (parent)')
-
-    def __setitem__(self, path, address):
-        path = normalize_path(path)
-        ancestors = get_ancestors(path)
-        shard, offset, size = address
-
-        self.cursor.execute('BEGIN TRANSACTION')
-        try:
-            self.cursor.execute(
-                'INSERT INTO files VALUES (?, ?, ?, ?, ?)',
-                (path, get_parent(path), *address))
-
-            self.cursor.executemany("""
-                INSERT INTO directories (path, parent, total_size, total_file_count) 
-                VALUES (?, ?, ?, 1)
-                ON CONFLICT(path) DO UPDATE 
-                SET total_size = total_size + excluded.total_size, 
-                    total_file_count = total_file_count + 1
-                """, ((ancestor, get_parent(ancestor), size) for ancestor in ancestors))
-
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-
-    def close(self):
-        self.cursor.close()
-        self.conn.commit()
-        self.conn.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-
-def normalize_path(path):
-    return osp.normpath(path).removeprefix('/').removeprefix('.')
-
-
-def get_parent(path):
-    if path == '':
-        # root already, has no parent
-        return b'\x00'
-
-    partition = path.rpartition('/')
-    return partition[0]
-
-
-def get_ancestors(path):
-    components = path.split('/')
-    return ('/'.join(components[:i]) for i in range(len(components)))
-
-
-def get_sha1(path):
-    checksum = hashlib.sha1()
-    with open(path, 'rb') as f:
-        while chunk := f.read(8192):
-            checksum.update(chunk)
-    return checksum.hexdigest()
 
 
 class FileSection:
-    # Not thread-safe!
     def __init__(self, file, start, size):
         self.file = file
         self.start = start
         self.end = start + size
-        self.position = 0
+        self.position = start
 
     def read(self, size=-1):
-        self.file.seek(self.start + self.position)
-
-        if self.position + size > self.end or size == -1:
+        size = min(size, self.end - self.position)
+        if size == -1:
             size = self.end - self.position
-        result = self.file.read(size)
-        self.position += len(result)
-        return result
 
-    def close(self):
-        pass
+        self.file.seek(self.position)
+        data = self.file.read(size)
 
-    def __enter__(self):
-        return self
+        self.position += len(data)
+        return data
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+    def readline(self, size=-1):
+        size = min(size, self.end - self.position)
+        if size == -1:
+            size = self.end - self.position
+
+        self.file.seek(self.position)
+        data = self.file.readline(size)
+
+        self.position += len(data)
+        return data
 
     def tell(self):
         return self.position
 
     def seek(self, offset, whence=0):
         if whence == 0:
-            self.position = offset
+            self.position = self.start + offset
         elif whence == 1:
             self.position += offset
         elif whence == 2:
             self.position = self.end + offset
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
