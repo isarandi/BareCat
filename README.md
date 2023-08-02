@@ -10,7 +10,7 @@ with focus on fast random access and minimal overhead.
 A typical use case for motivating BareCat is storing image files for training deep learning models, where the
 files are accessed randomly during training. The files are typically stored on a network file
 system, where accessing many small files can be slow, and clusters often put a limit on the number
-of files of a user. To avoid these problems, the files should be stored in a single archive file.
+of files of a user. To avoid these problems, the files should be stored in a single archive file (or at most a few).
 However, typical archive formats such as tar are not suitable, since they don't allow fast random
 lookups. We need an index into the archive, and the index itself cannot be required to be loaded
 into memory, to support very large datasets.
@@ -102,7 +102,8 @@ See for example:
 - https://github.com/devsnd/tarindexer
 
 Other alternatives include TensorFlow's TFRecord format or HDF5. However, these are more complex to use
-and have many features that are not needed for this use case.
+and have many features that are not needed for this use case. Furthermore, TFRecords doesn't support random access
+and HDF5 doesn't support dictionary-like fast lookups.
 
 
 ![BareCat](barecat.jpg)
