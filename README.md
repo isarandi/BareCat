@@ -3,9 +3,11 @@
 BareCat (**bare**bones con**cat**enation) is a simple archive file format for storing many files,
 with focus on fast random access and minimal overhead.
 
+![Architecture](figure.png)
+
 ## Motivation
 
-A typical use case for BareCat is storing image files for training deep learning models, where the
+A typical use case for motivating BareCat is storing image files for training deep learning models, where the
 files are accessed randomly during training. The files are typically stored on a network file
 system, where accessing many small files can be slow, and clusters often put a limit on the number
 of files of a user. To avoid these problems, the files should be stored in a single archive file.
