@@ -5,14 +5,21 @@ import sqlite3
 
 
 class IndexReader:
-    def __init__(self, path):
-        self.conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
-        self.fetcher = Fetcher(self.conn)
+    def __init__(self, path, buffer_size=32):
+        try:
+            self.conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        except sqlite3.OperationalError as e:
+            raise ValueError(f'Could not open index {path}') from e
+
+        self.fetcher = Fetcher(self.conn, buffer_size=buffer_size)
 
     def __getitem__(self, path):
         path = normalize_path(path)
-        return self.fetcher.fetch_one(
+        res = self.fetcher.fetch_one(
             'SELECT shard, offset, size, crc32 FROM files WHERE path=?', (path,))
+        if res is None:
+            raise KeyError(path)
+        return res
 
     def get_nth(self, n):
         path, shard, offset, size, crc32 = self.fetcher.fetch_one(
@@ -108,6 +115,7 @@ class IndexReader:
         return self.fetcher.fetch_one('SELECT size FROM files WHERE path=?', (path,))[0]
 
     def __contains__(self, path):
+        path = normalize_path(path)
         return self.fetcher.fetch_one('SELECT 1 FROM files WHERE path=?', (path,)) is not None
 
     def reverse_lookup(self, shard, offset):
@@ -125,14 +133,15 @@ class IndexReader:
 
 
 class Fetcher:
-    def __init__(self, conn):
+    def __init__(self, conn, buffer_size=32):
         self.conn = conn
         self.cursor = conn.cursor()
+        self.buffer_size = buffer_size
 
-    def fetch_iter(self, query, params=(), buffer_size=32, cursor=None):
+    def fetch_iter(self, query, params=(), cursor=None):
         cursor = self.conn.cursor() if cursor is None else cursor
         cursor.execute(query, params)
-        while rows := cursor.fetchmany(buffer_size):
+        while rows := cursor.fetchmany(self.buffer_size):
             yield from rows
 
     def fetch_one(self, query, params=(), cursor=None):
@@ -147,45 +156,54 @@ class Fetcher:
 
 
 class IndexWriter:
-    def __init__(self, path, overwrite=False):
+    def __init__(self, path, overwrite=False, append=False):
         if osp.exists(path):
             if overwrite:
                 os.remove(path)
-            else:
+            elif not append:
                 raise FileExistsError(path)
 
-        self.conn = sqlite3.connect(path)
+        try:
+            self.conn = sqlite3.connect(path)
+        except sqlite3.OperationalError as e:
+            raise ValueError(f'Could not open index {path}') from e
+
         self.cursor = self.conn.cursor()
-        self.cursor.execute(f"""
-            CREATE TABLE files (
-                path TEXT PRIMARY KEY, 
-                parent TEXT, 
-                shard INTEGER,
-                offset INTEGER, 
-                size INTEGER,
-                crc32 INTEGER NULL
-            )
-        """)
-        self.cursor.execute(f"""
-            CREATE TABLE directories (
-                path TEXT PRIMARY KEY, 
-                parent TEXT,
-                has_subdirs BOOLEAN DEFAULT FALSE,
-                has_files BOOLEAN DEFAULT FALSE,
-                total_size INTEGER DEFAULT 0, 
-                total_file_count INTEGER DEFAULT 0
-            )
-        """)
-        self.cursor.execute('CREATE INDEX idx_directories_parent ON directories (parent)')
-        self.cursor.execute('CREATE INDEX idx_files_parent ON files (parent)')
+
+        if not append:
+            self.cursor.execute(f"""
+                CREATE TABLE files (
+                    path TEXT PRIMARY KEY, 
+                    parent TEXT, 
+                    shard INTEGER,
+                    offset INTEGER, 
+                    size INTEGER,
+                    crc32 INTEGER NULL
+                )
+            """)
+            self.cursor.execute(f"""
+                CREATE TABLE directories (
+                    path TEXT PRIMARY KEY, 
+                    parent TEXT,
+                    has_subdirs BOOLEAN DEFAULT FALSE,
+                    has_files BOOLEAN DEFAULT FALSE,
+                    total_size INTEGER DEFAULT 0, 
+                    total_file_count INTEGER DEFAULT 0
+                )
+            """)
+            self.cursor.execute('CREATE INDEX idx_directories_parent ON directories (parent)')
+            self.cursor.execute('CREATE INDEX idx_files_parent ON files (parent)')
 
     def add_item(self, path, shard, offset, size, crc32=None):
         path = normalize_path(path)
         ancestors = get_ancestors(path)
         parent = get_parent(path)
-        self.cursor.execute(
-            'INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)',
-            (path, parent, shard, offset, size, crc32))
+        try:
+            self.cursor.execute(
+                'INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)',
+                (path, parent, shard, offset, size, crc32))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f'File {path} already exists in index') from e
 
         self.cursor.executemany("""
             INSERT INTO directories (
@@ -198,6 +216,38 @@ class IndexWriter:
                 total_file_count = total_file_count + 1
             """, ((ancestor, get_parent(ancestor), ancestor != parent, ancestor == parent, size)
                   for ancestor in ancestors))
+
+    def add_items(self, items):
+        paths = [normalize_path(item[0]) for item in items]
+        ancestorss = [get_ancestors(p) for p in paths]
+        parents = [get_parent(path) for path in paths]
+        sizes = [item[1][2] for item in items]
+
+        try:
+            self.cursor.executemany(
+                'INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)',
+                ((path, parent, shard, offset, size, crc32)
+                 for (path, (shard, offset, size, crc32)), parent in zip(items, parents)))
+        except sqlite3.IntegrityError as e:
+            raise ValueError(f'File already exists in index', paths) from e
+
+        self.cursor.executemany("""
+            INSERT INTO directories (
+                path, parent, has_subdirs, has_files, total_size, total_file_count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT (path) DO UPDATE SET
+                has_subdirs = has_subdirs OR excluded.has_subdirs,
+                has_files = has_files OR excluded.has_files,
+                total_size = total_size + excluded.total_size,
+                total_file_count = total_file_count + 1
+            """, ((ancestor, get_parent(ancestor), ancestor != parent, ancestor == parent, size)
+                  for size, parent, ancestors in zip(sizes, parents, ancestorss)
+                  for ancestor in ancestors))
+
+    def __contains__(self, path):
+        path = normalize_path(path)
+        self.cursor.execute('SELECT 1 FROM files WHERE path=?', (path,))
+        return self.cursor.fetchone() is not None
 
     def close(self):
         self.cursor.close()

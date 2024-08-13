@@ -46,8 +46,8 @@ find . -name '*.jpg' -print0 | barecat-create --null --file mydata.barecat --sha
 This may yield the following files:
 
 ```
-mydata.barecat-00000-of-00002
-mydata.barecat-00001-of-00002
+mydata.barecat-shard-00001
+mydata.barecat-shard-00002
 mydata.barecat-sqlite-index
 ```
 

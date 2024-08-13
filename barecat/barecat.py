@@ -1,7 +1,6 @@
 import binascii
 import glob
 import io
-import os
 import os.path as osp
 import shutil
 
@@ -11,7 +10,7 @@ from barecat.indexing import IndexReader, IndexWriter
 class Reader:
     def __init__(self, path, decoder=None):
         self.index = IndexReader(f'{path}-sqlite-index')
-        shard_names = sorted(glob.glob(f'{path}-*-of-*'))
+        shard_names = sorted(glob.glob(f'{path}-shard-*'))
         self.shard_files = [open(p, mode='rb') for p in shard_names]
         self.decoder = decoder if decoder is not None else lambda x: x
 
@@ -28,7 +27,10 @@ class Reader:
         return path, self.read_from_address(shard, offset, size, crc32)
 
     def read_from_address(self, shard, offset, size, expected_crc32=None):
-        shard_file = self.shard_files[shard]
+        try:
+            shard_file = self.shard_files[shard]
+        except IndexError:
+            raise IndexError(f"Shard {shard} not found") from None
         shard_file.seek(offset)
         data = shard_file.read(size)
 
@@ -71,13 +73,21 @@ class Reader:
 
 
 class Writer:
-    def __init__(self, path, shard_size=None, overwrite=False, encoder=None):
+    def __init__(self, path, shard_size=None, overwrite=False, encoder=None, append=False):
         self.path = path
         self.shard_size = shard_size
-        self.index = IndexWriter(f'{self.path}-sqlite-index', overwrite=overwrite)
-        self.i_shard = 0
-        self.shard_file = open(
-            f'{self.path}-{self.i_shard:05d}', mode='wb' if overwrite else 'xb')
+        self.index = IndexWriter(
+            f'{self.path}-sqlite-index', overwrite=overwrite, append=append)
+
+        if append:
+            self.i_shard = max(0, len(glob.glob(f'{self.path}-shard-*')) - 1)
+            self.shard_file = open(
+                f'{self.path}-shard-{self.i_shard:05d}', mode='ab')
+        else:
+            self.i_shard = 0
+            self.shard_file = open(
+                f'{self.path}-shard-{self.i_shard:05d}', mode='wb' if overwrite else 'xb')
+
         self.encoder = encoder if encoder is not None else lambda x: x
 
     def __setitem__(self, path, content):
@@ -98,7 +108,7 @@ class Writer:
             if self.shard_file.tell() + size > self.shard_size:
                 self.shard_file.close()
                 self.i_shard += 1
-                self.shard_file = open(f'{self.path}-{self.i_shard:05d}', 'wb')
+                self.shard_file = open(f'{self.path}-shard-{self.i_shard:05d}', 'wb')
 
         offset = self.shard_file.tell()
         crc32 = 0
@@ -110,15 +120,9 @@ class Writer:
     def close(self):
         self.index.close()
         self.shard_file.close()
-        self.rename_shards()
 
-    def rename_shards(self):
-        n_shards = self.i_shard + 1
-        for i in range(n_shards):
-            shard_file = f'{self.path}-{i:05d}'
-            renamed_file = f'{self.path}-{i:05d}-of-{n_shards:05d}'
-            os.rename(shard_file, renamed_file)
-        return n_shards
+    def __contains__(self, path):
+        return path in self.index
 
     def __enter__(self):
         return self
