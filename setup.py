@@ -23,4 +23,7 @@ setup(
             'barecat-viewer=barecat.viewerqt6:main',
         ],
     }
+    install_requires=[
+        'multiprocessing-utils'
+    ],
 )
