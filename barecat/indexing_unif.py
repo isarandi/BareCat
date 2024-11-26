@@ -434,7 +434,8 @@ class Fetcher:
 
 
 def normalize_path(path):
-    return osp.normpath(path).removeprefix('/').removeprefix('.')
+    x = osp.normpath(path).removeprefix('/')
+    return '' if x == '.' else x
 
 
 def get_parent(path):
