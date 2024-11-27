@@ -22,7 +22,7 @@ setup(
             'barecat-verify=barecat.command_line_interface:verify_integrity',
             'barecat-viewer=barecat.viewerqt6:main',
         ],
-    }
+    },
     install_requires=[
         'multiprocessing-utils'
     ],
