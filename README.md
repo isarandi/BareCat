@@ -46,17 +46,19 @@ statistics (total file size, number of files) for each directory.
 
 ## Features
 
-- **Fast random access**: the archive can be accessed randomly, addressed by filepath,
+- **Fast random access**: The archive can be accessed randomly, addressed by filepath,
   without having to scan the entire archive or all the metadata.
   The index is stored in a separate SQLite database file, which itself does not need to be loaded
-  entirely into memory.
-- **Sharding**: to make it easier to move the data around or to distribute it across multiple
+  entirely into memory. Ideal for storing training image data for deep learning jobs.
+- **Sharding**: To make it easier to move the data around or to distribute it across multiple
   storage devices, the archive can be split into multiple files of equal size (shards, or volumes). 
   The shards do not have to be concatenated to be used, the library will keep all shard files open
   and load data from the appropriate one during normal operations.
-- **Browsability**: The SQLite database contains an index for the parent directories, allowing
+- **Fast browsing**: The SQLite database contains an index for the parent directories, allowing
   fast listing of directory contents and aggregate statistics (total file size, number of files).
-- **Simple storage**: The files are simply concatenated after each other and the index contains
+- **Intuitive API**: Familiar filesystem-like API, as well as a dictionary-like one.
+- **Mountable**: The archive can be efficiently mounted in readonly or read-write mode.
+- **Simple storage format**: The files are simply concatenated after each other and the index contains
   the offsets and sizes of each file. There is no header format to understand. The index can be
   dumped into any format with simple SQL queries.
 
