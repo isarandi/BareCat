@@ -94,23 +94,77 @@ barecat-extract --file=mydata.barecat --target-directory=targetdir/
 
 import barecat
 
-with barecat.Barecat('mydata.barecat', readonly=False) as bc_writer:
-  bc_writer['path/to/file/as/stored.jpg'] = binary_file_data
-  bc_writer.add_by_path('path/to/file/on/disk.jpg')
+with barecat.Barecat('mydata.barecat', readonly=False) as bc:
+  bc['path/to/file/as/stored.jpg'] = binary_file_data
+  bc.add_by_path('path/to/file/on/disk.jpg')
   
   with open('path', 'rb') as f:
-    bc_writer.add('path/to/file/on/disk.jpg', fileobj=f)
-
+    bc.add('path/to/file/on/disk.jpg', fileobj=f)
     
-reader = barecat.Reader('mydata.barecat')
-binary_file_data = reader['path/to/file.jpg']
-subdirnames, filenames = reader.iterdir_infos('path/to/directory')
-
-reader.close()  # or use a context manager in a `with` block
-
+with barecat.Barecat('mydata.barecat') as bc:
+  binary_file_data = bc['path/to/file.jpg']
+  entrynames = bc.listdir('path/to')
+  for root, dirs, files in bc.walk('path/to/something'):
+    print(root, dirs, files)
+    
+  paths = bc.glob('path/to/**/*.jpg', recursive=True)
+  
+  with bc.open('path/to/file.jpg', 'rb') as f:
+    data = f.read(123)
 ```
 
-## Image Viewer
+## Mounting via FUSE
+
+Barecat archives can be mounted via FUSE, allowing it to be used like a filesystem.
+It can handle at least tens of millions of files and terabytes of data, even over 100k files in
+single directories. Directory listing is written to produce the results in a streaming fashion,
+so entries will start appearing even in huge directories fairly quickly. 
+
+```bash
+
+# readonly:
+barecat-mount mydata.barecat mountpoint/
+
+# read-write:
+barecat-mount --writable mydata.barecat mountpoint/
+
+# unmount:
+fusermount -u mountpoint/
+# or
+umount mountpoint/
+```  
+
+Since Barecat always adds new files at the end of the archive, many deletions and insertions
+will lead to fragmentation. The general idea is to write once, read many times, and do
+deletions only when you need to fix a mistake. There is basic heuristic auto-defragmentation
+that can be enabled as follows:
+
+```bash
+barecat-mount --writable --enable-defrag mydata.barecat mountpoint/
+```
+
+This way, the filesystem will periodically defragment itself after significant amount of deletions.
+You can also perform a defrag with:
+
+```bash
+barecat-defrag mydata.barecat
+```
+
+This will go in sequence and move all the files towards the beginning of the archive, leaving
+no gaps. This may take very long, since even closing one byte gap requires moving all the
+following data. A quick option is available with:
+
+```bash
+barecat-defrag --quick mydata.barecat
+```
+
+This will proceed backwards, starting from the end of the archive, and will move each file
+into the first available gap, counted from the beginning of the archive (first-fit). The 
+algorithm stops after meeting the first file that has no gap that can fit it.
+
+...documentation to be continued...
+
+## Image viewer
 
 Barecat comes with a simple image viewer that can be used to browse the contents of a Barecat
 archive.
@@ -118,26 +172,5 @@ archive.
 ```bash
 barecat-image-viewer mydata.barecat
 ```
-
-## Similar projects
-
-This project is inspired by Ali Athar's file
-packer https://github.com/Ali2500/TarViS/tree/main/tarvis/data/file_packer,
-but there are many similar projects out there, though none seemed to match my requirements.
-
-See for example:
-- https://github.com/digidem/indexed-tarball
-- https://github.com/colon3ltocard/pyindexedtar
-- https://github.com/mxmlnkn/ratarmount/tree/master
-- https://github.com/coelias/tarindex
-- https://github.com/devsnd/tarindexer
-
-Other alternatives include TensorFlow's TFRecord format or HDF5. However, these are more complex to use
-and have many features that are not needed for this use case. Furthermore, TFRecords doesn't support random access
-and HDF5 doesn't support dictionary-like fast lookups.
-
-
-![Barecat](barecat.jpg)
-
 
  
