@@ -1,17 +1,24 @@
 import argparse
+import os
 import os.path as osp
 import pprint
+import re
+import shutil
 import sys
+from typing import List
 
 import msgpack_numpy
-import simplepyutils as spu
-from PyQt6.QtCore import QBuffer, QByteArray, QModelIndex, Qt, pyqtSlot
-from PyQt6.QtGui import QFont, QFontMetrics, QImageReader, QPixmap, QStandardItem, \
+from PyQt6.QtCore import QBuffer, QByteArray, QMimeData, QModelIndex, Qt, pyqtSlot
+from PyQt6.QtGui import QClipboard, QFont, QFontMetrics, QImageReader, QPixmap, QStandardItem, \
     QStandardItemModel
-from PyQt6.QtWidgets import QAbstractItemView, QApplication, QHBoxLayout, QHeaderView, QLabel, \
-    QScrollArea, QSplitter, QStyleFactory, QTableView, QTreeView, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QHBoxLayout,
+                             QHeaderView, \
+                             QLabel, QMenu, QScrollArea, QSplitter, QStyleFactory, QTableView,
+                             QTreeView, QVBoxLayout, \
+                             QWidget)
 
 import barecat
+from barecat.common import BarecatDirInfo, BarecatFileInfo
 
 
 def main():
@@ -21,15 +28,15 @@ def main():
     parser = argparse.ArgumentParser(description='View images stored in a barecat archive.')
     parser.add_argument('path', type=str, help='path to load from')
     args = parser.parse_args()
-    viewer = BareCatViewer(args.path)
+    viewer = BarecatViewer(args.path)
     viewer.show()
     sys.exit(app.exec())
 
 
-class BareCatViewer(QWidget):
+class BarecatViewer(QWidget):
     def __init__(self, path):
         super().__init__()
-        self.file_reader = barecat.Reader(path)
+        self.file_reader = barecat.Barecat(path)
         self.barecat_path = path
         self.tree = QTreeView()
         self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -55,6 +62,8 @@ class BareCatViewer(QWidget):
         self.tree.selectionModel().selectionChanged.connect(self.update_file_table)
         self.tree.activated.connect(self.expand_tree_item)
         self.tree.doubleClicked.connect(self.expand_tree_item)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
 
         root_index = self.tree.model().index(0, 0)
         self.tree.setCurrentIndex(root_index)
@@ -70,18 +79,20 @@ class BareCatViewer(QWidget):
         model = QStandardItemModel()
         model.setHorizontalHeaderLabels(['Name', 'Size'])
         ft.setModel(model)
-        ft.selectionModel().selectionChanged.connect(self.show_file)
+        ft.selectionModel().selectionChanged.connect(self.show_selected_file)
         ft.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         ft.horizontalHeader().setStyleSheet(
             "QHeaderView::section {font-weight: normal; text-align: left;}")
+        ft.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        ft.customContextMenuRequested.connect(self.show_file_table_context_menu)
         return ft
 
     def fill_tree(self):
         root_item = TreeItem(self.file_reader)
-        size, count, has_subdirs, has_files = self.file_reader.index.get_dir_info('')
+        dinfo: BarecatDirInfo = self.file_reader.index.lookup_dir('')
         item = TreeItem(
-            self.file_reader, path='', size=size, count=count, has_subdirs=has_subdirs,
-            parent=root_item)
+            self.file_reader, path='', size=dinfo.size_tree, count=dinfo.num_files_tree,
+            has_subdirs=dinfo.num_subdirs > 0, parent=root_item)
         root_item.children.append(item)
         self.model = LazyItemModel(root_item)
         self.tree.setModel(self.model)
@@ -109,26 +120,33 @@ class BareCatViewer(QWidget):
 
         model = self.file_table.model()
         model.removeRows(0, model.rowCount())
-        files_and_sizes = self.file_reader.index.get_files_with_size(item.path)
-        files_and_sizes = sorted(files_and_sizes, key=lambda x: spu.natural_sort_key(x[0]))
-        for file, size in files_and_sizes:
-            file_item = QStandardItem(osp.basename(file))
-            file_item.setData(file, Qt.ItemDataRole.UserRole)  # Store the full path as user data
-            model.appendRow([file_item, QStandardItem(format_size(size))])
+        finfos: List[BarecatFileInfo] = self.file_reader.index.list_direct_fileinfos(item.path)
+        finfos = sorted(finfos, key=lambda x: natural_sort_key(x.path))
+        for finfo in finfos:
+            file_item = QStandardItem(osp.basename(finfo.path))
+            file_item.setData(finfo, Qt.ItemDataRole.UserRole)  # Store the fileinfo as user data
+            model.appendRow([file_item, QStandardItem(format_size(finfo.size))])
 
-        if len(files_and_sizes) > 0:
+        if len(finfos) > 0:
             first_file_index = self.file_table.model().index(0, 0)
             self.file_table.setCurrentIndex(first_file_index)
+        else:
+            for dinfo, subdinfos, finfos in self.file_reader.index.walk_infos(item.path):
+                finfo = next(iter(finfos), None)
+                if finfo is not None:
+                    self.show_file(finfo)
+                    break
 
-    def show_file(self, selected, deselected):
+    def show_selected_file(self, selected, deselected):
         indexes = selected.indexes()
         if not indexes:
             return
+        path = self.file_table.model().item(indexes[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        self.show_file(path)
 
-        index = indexes[0]
-        path = self.file_table.model().item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
-        content = self.file_reader[path]
-        extension = osp.splitext(path)[1].lower()
+    def show_file(self, finfo):
+        content = self.file_reader.read(finfo)
+        extension = osp.splitext(finfo.path)[1].lower()
         if extension in ('.jpg', '.jpeg', '.png', '.gif', '.bmp'):
             byte_array = QByteArray(content)
             buffer = QBuffer(byte_array)
@@ -144,12 +162,67 @@ class BareCatViewer(QWidget):
         elif extension == '.msgpack':
             data = msgpack_numpy.unpackb(content)
             self.content_viewer.setText(data)
-
         else:
             self.content_viewer.setText(repr(content))
 
     def update_image_label(self, pixmap):
         self.content_viewer.setPixmap(pixmap)
+
+    def show_file_table_context_menu(self, position):
+        menu = QMenu()
+        extract_action = menu.addAction("Extract file...")
+        copy_path_action = menu.addAction("Copy path")
+
+        action = menu.exec(self.file_table.viewport().mapToGlobal(position))
+
+        if action == extract_action:
+            indexes = self.file_table.selectionModel().selectedRows()
+            if indexes:
+                path_of_what_to_extract = self.file_table.model().item(indexes[0].row(), 0).data(
+                    Qt.ItemDataRole.UserRole)
+                default_filename = osp.basename(path_of_what_to_extract)
+                target_filename, _ = QFileDialog.getSaveFileName(
+                    self, "Select Target File", default_filename)
+                if target_filename:
+                    self.extract_file(path_of_what_to_extract, target_filename)
+        elif action == copy_path_action:
+            indexes = self.file_table.selectionModel().selectedRows()
+            if indexes:
+                path = self.file_table.model().item(indexes[0].row(), 0).data(
+                    Qt.ItemDataRole.UserRole)
+                clipboard = QApplication.clipboard()
+                clipboard.setText(path)
+
+    def show_tree_context_menu(self, position):
+        menu = QMenu()
+        extract_action = menu.addAction("Extract directory...")
+        copy_path_action = menu.addAction("Copy path")
+
+        action = menu.exec(self.tree.viewport().mapToGlobal(position))
+        if action == extract_action:
+            index = self.tree.indexAt(position)
+            if index.isValid():
+                if target_directory := QFileDialog.get(self, "Select Target Directory"):
+                    self.extract_directory(index.internalPointer().path, target_directory)
+        elif action == copy_path_action:
+            index = self.tree.indexAt(position)
+            if index.isValid():
+                clipboard = QApplication.clipboard()
+                clipboard.setText(index.internalPointer().path)
+
+    def extract_file(self, path_of_what_to_extract, target_filename):
+        with open(target_filename, 'wb') as f:
+            shutil.copyfileobj(self.file_reader.open(path_of_what_to_extract), f)
+
+    def extract_directory(self, dir_in_archive, target_directory):
+        basename = osp.basename(dir_in_archive)
+        for dinfo, _, finfos in self.file_reader.index.walk_infos():
+            for finfo in finfos:
+                target_path = osp.join(
+                    target_directory, basename, osp.relpath(finfo.path, dir_in_archive))
+                os.makedirs(osp.dirname(target_path), exist_ok=True)
+                with open(target_path, 'wb') as f:
+                    shutil.copyfileobj(self.file_reader.open(finfo.path), f)
 
 
 class ContentViewer(QWidget):
@@ -163,6 +236,9 @@ class ContentViewer(QWidget):
         self.scrollArea.setWidget(self.label)
         layout = QVBoxLayout(self)
         layout.addWidget(self.scrollArea)
+
+        self.label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.label.customContextMenuRequested.connect(self.show_context_menu)
 
     def setPixmap(self, pixmap):
         self.originalPixmap = pixmap
@@ -209,6 +285,18 @@ class ContentViewer(QWidget):
         elif self.originalText:
             self.updateText()
         super().resizeEvent(event)
+
+    def show_context_menu(self, position):
+        menu = QMenu()
+        copy_image_action = menu.addAction("Copy image")
+
+        action = menu.exec(self.mapToGlobal(position))
+
+        if action == copy_image_action and self.originalPixmap:
+            clipboard = QApplication.clipboard()
+            mime_data = QMimeData()
+            mime_data.setImageData(self.originalPixmap.toImage())
+            clipboard.setMimeData(mime_data, QClipboard.Mode.Clipboard)
 
 
 class LazyItemModel(QStandardItemModel):
@@ -294,12 +382,12 @@ class TreeItem:
     def fetch_more(self):
         if self.fetched:
             return
-        subdir_infos = self.file_reader.index.get_subdir_infos(self.path)
-        subdir_infos = sorted(subdir_infos, key=lambda x: spu.natural_sort_key(x[0]))
-        for dir, size, count, has_subdirs, has_files in subdir_infos:
+        subdir_infos = self.file_reader.index.list_subdir_dirinfos(self.path)
+        subdir_infos = sorted(subdir_infos, key=lambda x: natural_sort_key(x.path))
+        for dinfo in subdir_infos:
             self.children.append(TreeItem(
-                self.file_reader, path=dir, size=size, count=count, has_subdirs=has_subdirs,
-                parent=self))
+                self.file_reader, path=dinfo.path, size=dinfo.size_tree, count=dinfo.num_files_tree,
+                has_subdirs=dinfo.num_subdirs > 0, parent=self))
 
         self.fetched = True
 
@@ -326,6 +414,11 @@ def format_count(size):
     if unit_index == 0:
         return str(size)
     return f'{size:.1f}{units[unit_index]}'
+
+
+def natural_sort_key(s):
+    """Normal string sort puts '10' before '2'. Natural sort puts '2' before '10'."""
+    return [float(t) if t.isdigit() else t for t in re.split('([0-9]+)', s)]
 
 
 if __name__ == '__main__':

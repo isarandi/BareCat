@@ -1,0 +1,1 @@
+include barecat/sql/*.sql

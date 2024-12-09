@@ -1,178 +1,31 @@
+
 import functools
 import glob
 import itertools
 import os
 import os.path as osp
-import queue
 import shutil
-import sys
-import threading
+from datetime import datetime
 
-import barecat.barecat_unif as barecat_unif
-
-
-def create_from_stdin_paths(target_path, shard_size, zero_terminated=False, overwrite=False):
-    with barecat_unif.BareCat(
-            target_path, shard_size=shard_size, readonly=False, overwrite=overwrite) as writer:
-        if zero_terminated:
-            input_paths = iterate_zero_terminated(sys.stdin.buffer)
-        else:
-            input_paths = (l.rstrip('\n') for l in sys.stdin)
-
-        for input_path in progressbar(input_paths, desc='Packing files', unit=' files'):
-            writer.add_by_path(input_path)
+import crc32c as crc32c_lib
 
 
-def create_from_stdin_paths_workers(
-        target_path, shard_size, zero_terminated=False, overwrite=False, workers=8):
-    import simplepyutils as spu
-    q = queue.Queue(maxsize=workers * 2)
-    writer_thread = threading.Thread(
-        target=barecat_writer_main, args=(target_path, shard_size, overwrite, q))
-    writer_thread.start()
-
-    if zero_terminated:
-        input_paths = iterate_zero_terminated(sys.stdin.buffer)
-    else:
-        input_paths = (l.rstrip('\n') for l in sys.stdin)
-
-    def putter(input_path):
-        return lambda x: q.put((input_path, x))
-
-    with spu.ThrottledPool(workers) as pool:
-        for input_path in progressbar(input_paths, desc='Packing files', unit=' files'):
-            pool.apply_async(
-                read_content, (input_path,), callback=putter(input_path))
-
-    q.put(None)
-    writer_thread.join()
-
-
-def read_content(input_path):
-    with open(input_path, 'rb') as in_file:
-        return in_file.read()
-
-
-def barecat_writer_main(target_path, shard_size, overwrite, q):
-    with barecat_unif.BareCat(
-            target_path, shard_size=shard_size, readonly=False, overwrite=overwrite) as writer:
-        while (data := q.get()) is not None:
-            input_path, content = data
-            writer[input_path] = content
-
-
-def extract(barecat_path, target_directory):
-    with barecat_unif.BareCat(barecat_path) as reader:
-        for path_in_archive in progressbar(reader, desc='Extracting files', unit=' files'):
-            with reader.open(path_in_archive) as file_in_archive:
-                target_path = osp.join(target_directory, path_in_archive)
-                os.makedirs(osp.dirname(target_path), exist_ok=True)
-                with open(target_path, 'wb') as output_file:
-                    shutil.copyfileobj(file_in_archive, output_file)
-
-
-def merge(source_paths, target_path, shard_size, overwrite=False):
-    with barecat_unif.BareCat(
-            target_path, shard_size=shard_size, readonly=False, overwrite=overwrite) as writer:
-        for source_path in source_paths:
-            with barecat_unif.BareCat(source_path, readonly=True) as reader:
-                for path_in_archive in progressbar(
-                        reader, desc=f'Merging files from {source_path}', unit=' files'):
-                    size = reader.index.get_file_size(path_in_archive)
-                    with reader.open(path_in_archive) as file_in_archive:
-                        try:
-                            writer.add(path_in_archive, fileobj=file_in_archive, size=size)
-                        except ValueError:
-                            print(f'Skipping duplicate file {path_in_archive}.')
-
-
-def merge_symlink(source_paths, target_path, overwrite=False):
-    buffer_size = 256
-    with barecat_unif.Index(f'{target_path}-sqlite-index', readonly=False) as index_writer:
-
-        total_shards = sum(len(glob.glob(f'{p}-*-of-*')) for p in source_paths)
-        i_out_shard = 0
-
-        for source_path in source_paths:
-            with barecat_unif.Index(
-                    f'{source_path}-sqlite-index', buffer_size=buffer_size) as reader:
-                for items in chunked(progressbar_items(reader), buffer_size):
-                    # try:
-                    index_writer.add_items(
-                        [(path, (shard + i_out_shard, offset, size, crc32))
-                         for path, (shard, offset, size, crc32) in items])
-                    # except ValueError:
-                    #    print(f'Skipping duplicate file {path}.')
-
-            for shard_path in sorted(glob.glob(f'{source_path}-*-of-*')):
-                os.symlink(
-                    os.path.relpath(shard_path, start=os.path.dirname(target_path)),
-                    f'{target_path}-{i_out_shard:05d}-of-{total_shards:05d}')
-                i_out_shard += 1
-
-
-def write_index(dictionary, target_path):
-    with barecat_unif.Index(target_path, readonly=False) as writer:
-        for path, address in dictionary.items():
-            writer[path] = address
-
-
-def read_index(path):
-    with barecat_unif.Index(path) as reader:
-        return dict(reader.items())
-
-
-def is_running_in_jupyter_notebook():
-    try:
-        # noinspection PyUnresolvedReferences
-        shell = get_ipython().__class__.__name__
-        if shell == 'ZMQInteractiveShell':
-            return True  # Jupyter notebook or qtconsole
-        elif shell == 'TerminalInteractiveShell':
-            return False  # Terminal running IPython
-        else:
-            return False  # Other type (?)
-    except NameError:
-        return False  # Probably standard Python interpreter
-
-
-def progressbar(iterable=None, *args, **kwargs):
-    import tqdm
-    if is_running_in_jupyter_notebook():
-        return tqdm.notebook.tqdm(iterable, *args, **kwargs)
-    elif sys.stdout.isatty():
-        return tqdm.tqdm(iterable, *args, dynamic_ncols=True, **kwargs)
-    elif iterable is None:
-        class X:
-            def update(self, *a, **kw):
-                pass
-
-        return X()
-    else:
-        return iterable
+def read_file(input_path, mode='r'):
+    with open(input_path, mode) as f:
+        return f.read()
 
 
 def remove(path):
     index_path = f'{path}-sqlite-index'
-    shard_paths = glob.glob(f'{path}-shard-*')
+    shard_paths = glob.glob(f'{path}-shard-?????')
     for path in [index_path] + shard_paths:
         os.remove(path)
 
 
-def progressbar_items(dictionary, *args, **kwargs):
-    return progressbar(dictionary.items(), total=len(dictionary), *args, **kwargs)
-
-
-def iterate_zero_terminated(fileobj):
-    partial_path = b''
-    while chunk := fileobj.read(4096):
-        parts = chunk.split(b'\x00')
-        parts[0] = partial_path + parts[0]
-        partial_path = parts.pop()
-
-        for input_path in parts:
-            input_path = input_path.decode()
-            yield input_path
+def exists(path):
+    index_path = f'{path}-sqlite-index'
+    shard_paths = glob.glob(f'{path}-shard-?????')
+    return osp.exists(index_path) or len(shard_paths) > 0
 
 
 # From `more-itertools` package.
@@ -225,3 +78,222 @@ def take(n, iterable):
 
     """
     return list(itertools.islice(iterable, n))
+
+
+def copy_n_bytes(src_file, dest_file, n=None, bufsize=64 * 1024):
+    if n is None:
+        return shutil.copyfileobj(src_file, dest_file, bufsize)
+
+    bytes_to_copy = n
+    while bytes_to_copy > 0:
+        data = src_file.read(min(bufsize, bytes_to_copy))
+        if not data:
+            raise ValueError('Unexpected EOF')
+
+        dest_file.write(data)
+        bytes_to_copy -= len(data)
+
+
+def normalize_path(path):
+    x = osp.normpath(path).removeprefix('/')
+    return '' if x == '.' else x
+
+
+def get_parent(path):
+    if path == '':
+        # root already, has no parent
+        return b'\x00'
+
+    partition = path.rpartition('/')
+    return partition[0]
+
+
+def partition_path(path):
+    if path == '':
+        # root already, has no parent
+        return b'\x00', path
+
+    parts = path.rpartition('/')
+    return parts[0], parts[2]
+
+
+def get_ancestors(path):
+    yield ''
+    for i in range(len(path)):
+        if path[i] == '/':
+            yield path[:i]
+
+
+def reopen(file, mode):
+    if file.mode == mode:
+        return file
+    file.close()
+    return open_(file.name, mode)
+
+
+def fileobj_crc32c_until_end(fileobj, bufsize=64 * 1024):
+    crc32c = 0
+    while chunk := fileobj.read(bufsize):
+        crc32c = crc32c_lib.crc32c(chunk, crc32c)
+    return crc32c
+
+
+def fileobj_crc32c(fileobj, size=-1, bufsize=64 * 1024):
+    if size == -1 or size is None:
+        return fileobj_crc32c_until_end(fileobj, bufsize)
+
+    crc32c = 0
+    n_full_bufs, remainder = divmod(size, bufsize)
+
+    for _ in range(n_full_bufs):
+        data = fileobj.read(bufsize)
+        if len(data) != bufsize:
+            raise ValueError('Unexpected EOF')
+        crc32c = crc32c_lib.crc32c(data, crc32c)
+
+    if remainder:
+        data = fileobj.read(remainder)
+        if len(data) != remainder:
+            raise ValueError('Unexpected EOF')
+        crc32c = crc32c_lib.crc32c(data, crc32c)
+
+    return crc32c
+
+
+def copyfileobj_crc32c_until_end(src_file, dst_file, bufsize=64 * 1024):
+    crc32c = 0
+    size = 0
+    while chunk := src_file.read(bufsize):
+        dst_file.write(chunk)
+        crc32c = crc32c_lib.crc32c(chunk, crc32c)
+        size += len(chunk)
+    return size, crc32c
+
+
+def copyfileobj_crc32c(src_file, dst_file, size=None, bufsize=64 * 1024):
+    if size is None:
+        return copyfileobj_crc32c_until_end(src_file, dst_file, bufsize)
+
+    crc32c = 0
+    n_bytes_transferred = 0
+    n_full_bufs, remainder = divmod(size, bufsize)
+
+    for _ in range(n_full_bufs):
+        data = src_file.read(bufsize)
+        if len(data) != bufsize:
+            raise ValueError('Unexpected EOF')
+
+        crc32c = crc32c_lib.crc32c(data, crc32c)
+        n_written = dst_file.write(data)
+        if n_written != len(data):
+            raise ValueError('Unexpected write problem')
+
+        n_bytes_transferred += n_written
+
+    if remainder:
+        data = src_file.read(remainder)
+        if len(data) != remainder:
+            raise ValueError('Unexpected EOF')
+
+        crc32c = crc32c_lib.crc32c(data, crc32c)
+        n_written = dst_file.write(data)
+        if n_written != len(data):
+            raise ValueError('Unexpected write problem')
+
+        n_bytes_transferred += n_written
+
+    return n_bytes_transferred, crc32c
+
+
+def copyfileobj(src_file, dst_file, size=None, bufsize=64 * 1024):
+    if size is None:
+        return shutil.copyfileobj(src_file, dst_file, bufsize)
+
+    n_bytes_transferred = 0
+    nreads, remainder = divmod(size, bufsize)
+
+    for _ in range(nreads):
+        data = src_file.read(bufsize)
+        dst_file.write(data)
+        n_bytes_transferred += len(data)
+
+    if remainder:
+        data = src_file.read(remainder)
+        dst_file.write(data)
+        n_bytes_transferred += len(data)
+
+    return n_bytes_transferred
+
+
+def write_zeroes(file, n, bufsize=64 * 1024):
+    n_written = 0
+    if n >= bufsize:
+        zeroes = bytearray(bufsize)
+        while n >= bufsize:
+            n_written += file.write(zeroes)
+            n -= bufsize
+    n_written += file.write(bytearray(n))
+    return n_written
+
+
+def raise_if_readonly(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self.readonly:
+            raise PermissionError('This function is not allowed in readonly mode')
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def raise_if_append_only(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self.append_only:
+            raise PermissionError('This function is not allowed in append-only mode')
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def raise_if_readonly_or_append_only(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self.readonly or self.append_only:
+            raise PermissionError('This function is not allowed in append-only mode')
+        return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def parse_size(size):
+    if size is None:
+        return None
+    units = dict(K=1024, M=1024 ** 2, G=1024 ** 3, T=1024 ** 4)
+    size = size.upper()
+
+    for unit, factor in units.items():
+        if unit in size:
+            return int(float(size.replace(unit, "")) * factor)
+
+    return int(size)
+
+
+def open_(path, mode, *args, **kwargs):
+    # This is like open() but supports an additional mode 'ax+b' which is like
+    # 'x+b' in that it fails if the file already exists, and creates it if it doesn't,
+    # but it also opens the file in append mode, like 'a+b'
+
+    if sorted(mode) == sorted('ax+b'):
+        fd = os.open(path, os.O_APPEND)
+        return os.fdopen(fd, 'a+b', *args, **kwargs)
+    return open(path, mode, *args, **kwargs)
+
+
+def datetime_to_ns(dt):
+    return int(dt.timestamp() * 1e9)
+
+
+def ns_to_datetime(ns):
+    return datetime.fromtimestamp(ns / 1e9)
+

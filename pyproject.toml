@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=42", "wheel", "cython>=3.0.0", "numpy", ]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "barecat"
+version = "0.2.0"
+description = """
+Efficient dataset storage format through barebones concatenation of binary files
+and an SQLite index. Optimized for fast random access in machine learning workloads.
+"""
+authors = [
+    { name = "István Sárándi", email = "istvan.sarandi@gmail.com" }
+]
+readme = "README.md"  # Path to your README if you have one
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+
+dependencies = ["multiprocessing-utils", "tqdm", "crc32c"]
+
+[project.scripts]
+barecat-create = "barecat.cli:create"
+barecat-extract = "barecat.cli:extract"
+barecat-merge = "barecat.cli:merge"
+barecat-merge-symlink = "barecat.cli:merge_symlink"
+barecat-extract-single = "barecat.cli:extract_single"
+barecat-index-to-csv = "barecat.cli:index_to_csv"
+barecat-verify = "barecat.cli:verify_integrity"
+barecat-to-ncdu-json = "barecat.cli:print_ncdu_json"
+archive2barecat = "barecat.cli:archive2barecat"
+barecat2archive = "barecat.cli:barecat2archive"
+barecat-defrag = "barecat.cli:defrag"
+barecat-create-recursive = "barecat.cli:create_recursive"
+barecat-mount = "barecat.cli:mount"
+barecat-viewer = "barecat.viewerqt6:main"
+
+[tool.setuptools]
+packages = ["barecat"]

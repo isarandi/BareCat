@@ -1,6 +1,8 @@
 import functools
+
 import multiprocessing_utils
-import barecat.barecat_unif as barecat_unif
+
+from barecat.core import barecat as barecat
 
 
 def threadlocal_decorate(decorator):
@@ -20,4 +22,5 @@ def threadlocal_decorate(decorator):
 
 @threadlocal_decorate(functools.lru_cache())
 def get_cached_reader(path, auto_codec=True):
-    return barecat_unif.BareCat(path, readonly=True, auto_codec=True)
+    return barecat.Barecat(path, readonly=True, auto_codec=auto_codec)
+
